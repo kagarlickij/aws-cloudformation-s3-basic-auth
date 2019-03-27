@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Metadata:
+  Author: Dmitriy Kagarlickij
+
+Parameters:
+  BucketName:
+    Type: String
+
+Resources:
+  LambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "BasicLambdaEdgePermissionsRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service:
+            - "lambda.amazonaws.com"
+            - "edgelambda.amazonaws.com"
+          Action:
+          - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"
+        - "arn:aws:iam::aws:policy/SecretsManagerReadWrite"
+
+  BasicAuthLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: "BasicAuthLambda"
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: "nodejs6.10"
+      Handler: "index.handler"
+      MemorySize: 128 # Viewer request limit
+      Timeout: 5 # Viewer request limit
+      # Environment: # Viewer request limit
+      Code:
+        ZipFile: |
+          'use strict';
+          exports.handler = (event, context, callback) => {
+              // Get request and request headers
+              const request = event.Records[0].cf.request;
+              const headers = request.headers;
+              // Load the AWS SDK
+              var AWS = require('aws-sdk');
+              // Create a Secrets Manager client
+              var client = new AWS.SecretsManager({
+                  region: "us-east-1" # Lambda@Edge limit
+              });
+              // Getting password value from AWS Secrets Manager
+              client.getSecretValue({SecretId: "BasicAuthPass"}, function(err, data) {
+                  var secret = data.SecretString;
+                  var jsonContent = JSON.parse(secret);
+                  var pwd = jsonContent.BasicAuthPass
+                  console.log(pwd);
+                  // Configure authentication
+                  const authUser = 'admin';
+                  // Construct the Basic Auth string
+                  const authString = 'Basic ' + new Buffer(authUser + ':' + pwd).toString('base64');
+                  // Require Basic authentication
+                  if ((typeof headers.authorization == 'undefined' || headers.authorization[0].value != authString) && request.method !== 'OPTIONS') {
+                      const body = 'Unauthorized';
+                      const response = {
+                          status: '401',
+                          statusDescription: 'Unauthorized',
+                          body: body,
+                          headers: {
+                              'www-authenticate': [{key: 'WWW-Authenticate', value:'Basic'}]
+                          },
+                      };
+                      callback(null, response);
+                  }
+                  // Continue request processing if authentication passed
+                  callback(null, request);
+              });
+          };
+
+  BasicAuthLambdaVersion:
+    Type: "AWS::Lambda::Version"
+    Properties:
+      Description : "1"
+      FunctionName : !Ref BasicAuthLambda
+
+  CloudFrontOriginAccessIdentity:
+    Type: "AWS::CloudFront::CloudFrontOriginAccessIdentity"
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: "CloudFront OAI"
+
+  Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref BucketName
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+            AllowedOrigins:
+              - "*"
+            MaxAge: 1800
+
+  BucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Statement:
+          -
+            Action:
+              - "s3:GetObject"
+            Effect: "Allow"
+            Resource: !Join [ "", [ "arn:aws:s3:::", !Ref Bucket, "/*" ] ]
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOriginAccessIdentity.S3CanonicalUserId
+
+  CloudFrontOriginDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        DefaultCacheBehavior:
+          TargetOriginId: "the-s3-bucket"
+          AllowedMethods:
+            - "GET"
+            - "HEAD"
+            - "OPTIONS"
+          CachedMethods:
+            - "HEAD"
+            - "GET"
+          Compress: false
+          DefaultTTL: 0
+          ForwardedValues:
+            QueryString: false
+            Headers:
+              - "Origin"
+              - "Access-Control-Request-Headers"
+              - "Access-Control-Request-Method"
+          LambdaFunctionAssociations:
+            - EventType: "viewer-request"
+              LambdaFunctionARN: !Ref BasicAuthLambdaVersion
+          MaxTTL: 0
+          MinTTL: 0
+          SmoothStreaming: false
+          ViewerProtocolPolicy: "allow-all"
+        Enabled: true
+        Origins:
+          - DomainName:
+              !Join [ "", [ !Ref BucketName, ".s3.amazonaws.com" ] ]
+            Id: "the-s3-bucket"
+            S3OriginConfig:
+              OriginAccessIdentity:
+                !Join [ "", [ "origin-access-identity/cloudfront/", !Ref CloudFrontOriginAccessIdentity ] ]
+        PriceClass: "PriceClass_100"
+        HttpVersion: "http2"
+        IPV6Enabled: false
